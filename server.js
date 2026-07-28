@@ -52,6 +52,16 @@ function describeWeatherCode(code) {
   return WEATHER_CODES[code] || 'Unknown conditions';
 }
 
+const COMPASS_POINTS = [
+  'N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+  'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW',
+];
+
+function degreesToCompass(degrees) {
+  const index = Math.round(degrees / 22.5) % 16;
+  return COMPASS_POINTS[index];
+}
+
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 // Simple in-memory cache so repeated texts in a short window don't each
@@ -76,7 +86,7 @@ async function getCached(key, ttlMs, fetchFn) {
 async function fetchCurrentWeather() {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
-    `&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m` +
+    `&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,relative_humidity_2m` +
     `&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto`;
 
   const res = await fetch(url);
@@ -110,15 +120,17 @@ function getWeeklyForecast() {
 function buildCurrentReply(data) {
   const c = data.current;
   const temp = Math.round(c.temperature_2m);
-  const feelsLike = Math.round(c.apparent_temperature);
-  const wind = Math.round(c.wind_speed_10m);
   const humidity = Math.round(c.relative_humidity_2m);
+  const wind = Math.round(c.wind_speed_10m);
+  const windDir = degreesToCompass(c.wind_direction_10m);
   const conditions = describeWeatherCode(c.weather_code);
 
   return (
     `Current conditions:\n` +
-    `${conditions}, ${temp}°F (feels like ${feelsLike}°F)\n` +
-    `Humidity: ${humidity}% | Wind: ${wind} mph`
+    `${conditions}\n` +
+    `Temp: ${temp}°F\n` +
+    `Humidity: ${humidity}%\n` +
+    `Wind: ${wind} mph ${windDir}`
   );
 }
 
