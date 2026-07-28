@@ -11,46 +11,13 @@ const PORT = process.env.PORT || 3000;
 const LATITUDE = 52.123950;
 const LONGITUDE = -111.154412;
 
+// Required: get a free key at https://openweathermap.org/api (no credit card
+// needed for this tier) and set it as an OPENWEATHER_API_KEY env var on Render.
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
+
 // Set to 'true' to validate that incoming requests really came from Twilio.
 // Requires TWILIO_AUTH_TOKEN to be set as an env var on Render.
 const VALIDATE_TWILIO_SIGNATURE = process.env.VALIDATE_TWILIO_SIGNATURE === 'true';
-
-// WMO weather codes -> human readable description
-// https://open-meteo.com/en/docs
-const WEATHER_CODES = {
-  0: 'Clear sky',
-  1: 'Mainly clear',
-  2: 'Partly cloudy',
-  3: 'Overcast',
-  45: 'Fog',
-  48: 'Depositing rime fog',
-  51: 'Light drizzle',
-  53: 'Moderate drizzle',
-  55: 'Dense drizzle',
-  56: 'Light freezing drizzle',
-  57: 'Dense freezing drizzle',
-  61: 'Slight rain',
-  63: 'Moderate rain',
-  65: 'Heavy rain',
-  66: 'Light freezing rain',
-  67: 'Heavy freezing rain',
-  71: 'Slight snow fall',
-  73: 'Moderate snow fall',
-  75: 'Heavy snow fall',
-  77: 'Snow grains',
-  80: 'Slight rain showers',
-  81: 'Moderate rain showers',
-  82: 'Violent rain showers',
-  85: 'Slight snow showers',
-  86: 'Heavy snow showers',
-  95: 'Thunderstorm',
-  96: 'Thunderstorm with slight hail',
-  99: 'Thunderstorm with heavy hail',
-};
-
-function describeWeatherCode(code) {
-  return WEATHER_CODES[code] || 'Unknown conditions';
-}
 
 const COMPASS_POINTS = [
   'N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
@@ -62,13 +29,16 @@ function degreesToCompass(degrees) {
   return COMPASS_POINTS[index];
 }
 
+function titleCase(str) {
+  return str.replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 // Weather data lives here, refreshed on a timer in the background — texts
-// never trigger a live API call themselves. This keeps our request volume
-// low and steady (which matters since Open-Meteo rate-limits by IP, and
-// Render's free tier shares IPs across many apps), and if a refresh fails
-// (e.g. a transient 429) we just keep serving the last known-good data.
+// never trigger a live API call themselves. This keeps request volume low
+// and steady, and if a refresh fails we just keep serving the last
+// known-good data instead of erroring out to the user.
 let currentWeatherCache = null;
 let forecastCache = null;
 
@@ -87,9 +57,8 @@ async function fetchWithRetry(url, retries = 2, delayMs = 2000) {
 
 async function refreshCurrentWeather() {
   const url =
-    `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
-    `&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,relative_humidity_2m` +
-    `&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto`;
+    `https://api.openweathermap.org/data/2.5/weather` +
+    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=imperial`;
 
   try {
     currentWeatherCache = await fetchWithRetry(url);
@@ -99,12 +68,13 @@ async function refreshCurrentWeather() {
   }
 }
 
+// OpenWeatherMap's free tier gives a 5-day forecast in 3-hour blocks, not a
+// single daily summary, so we fetch the raw blocks here and aggregate them
+// into per-day highs/lows/conditions in buildForecastReply below.
 async function refreshForecast() {
   const url =
-    `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
-    `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
-    `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch` +
-    `&timezone=auto&forecast_days=7`;
+    `https://api.openweathermap.org/data/2.5/forecast` +
+    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=imperial`;
 
   try {
     forecastCache = await fetchWithRetry(url);
@@ -121,12 +91,11 @@ setInterval(refreshCurrentWeather, 5 * 60 * 1000);
 setInterval(refreshForecast, 30 * 60 * 1000);
 
 function buildCurrentReply(data) {
-  const c = data.current;
-  const temp = Math.round(c.temperature_2m);
-  const humidity = Math.round(c.relative_humidity_2m);
-  const wind = Math.round(c.wind_speed_10m);
-  const windDir = degreesToCompass(c.wind_direction_10m);
-  const conditions = describeWeatherCode(c.weather_code);
+  const temp = Math.round(data.main.temp);
+  const humidity = Math.round(data.main.humidity);
+  const wind = Math.round(data.wind.speed);
+  const windDir = degreesToCompass(data.wind.deg);
+  const conditions = titleCase(data.weather[0].description);
 
   return (
     `Current conditions:\n` +
@@ -137,20 +106,54 @@ function buildCurrentReply(data) {
   );
 }
 
-function buildForecastReply(data) {
-  const d = data.daily;
-  const lines = ['7-day forecast:'];
+// Groups the 3-hour forecast blocks by calendar date and reduces each day
+// down to a high, low, worst rain chance, and a representative condition.
+function groupForecastByDay(list) {
+  const days = new Map();
 
-  for (let i = 0; i < d.time.length; i++) {
-    const date = new Date(d.time[i] + 'T00:00:00');
+  for (const block of list) {
+    const date = block.dt_txt.split(' ')[0]; // "2026-07-29"
+    if (!days.has(date)) {
+      days.set(date, {
+        date,
+        high: block.main.temp_max,
+        low: block.main.temp_min,
+        rainChance: block.pop,
+        // Prefer the block closest to midday as the "representative" condition
+        conditions: block.weather[0].description,
+        hour: parseInt(block.dt_txt.split(' ')[1].split(':')[0], 10),
+      });
+    } else {
+      const day = days.get(date);
+      day.high = Math.max(day.high, block.main.temp_max);
+      day.low = Math.min(day.low, block.main.temp_min);
+      day.rainChance = Math.max(day.rainChance, block.pop);
+
+      const blockHour = parseInt(block.dt_txt.split(' ')[1].split(':')[0], 10);
+      if (Math.abs(blockHour - 12) < Math.abs(day.hour - 12)) {
+        day.conditions = block.weather[0].description;
+        day.hour = blockHour;
+      }
+    }
+  }
+
+  return [...days.values()];
+}
+
+function buildForecastReply(data) {
+  const days = groupForecastByDay(data.list);
+  const lines = ['5-day forecast:'];
+
+  days.forEach((day, i) => {
+    const date = new Date(day.date + 'T00:00:00');
     const dayLabel = i === 0 ? 'Today' : DAY_NAMES[date.getDay()];
-    const high = Math.round(d.temperature_2m_max[i]);
-    const low = Math.round(d.temperature_2m_min[i]);
-    const rain = d.precipitation_probability_max[i];
-    const conditions = describeWeatherCode(d.weather_code[i]);
+    const high = Math.round(day.high);
+    const low = Math.round(day.low);
+    const rain = Math.round(day.rainChance * 100);
+    const conditions = titleCase(day.conditions);
 
     lines.push(`${dayLabel}: ${conditions}, ${high}°/${low}°F, ${rain}% rain`);
-  }
+  });
 
   return lines.join('\n');
 }
@@ -187,7 +190,7 @@ app.post('/sms', async (req, res) => {
       twiml.message('Still loading forecast data — try again in a few seconds.');
     }
   } else {
-    twiml.message('Text "current" for current conditions or "forecast" for the 7-day forecast.');
+    twiml.message('Text "current" for current conditions or "forecast" for the 5-day forecast.');
   }
 
   res.type('text/xml').send(twiml.toString());
