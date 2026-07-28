@@ -1,0 +1,16 @@
+{
+  "name": "text-weather-bot",
+  "version": "1.0.0",
+  "description": "Text a Twilio number and get back the weather forecast for any location.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "twilio": "^5.3.0"
+  }
+}
