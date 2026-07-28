@@ -64,58 +64,61 @@ function degreesToCompass(degrees) {
 
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-// Simple in-memory cache so repeated texts in a short window don't each
-// trigger a fresh API call (this is also what protects us from Open-Meteo's
-// per-IP rate limit, which matters more on shared hosts like Render's free tier).
-const cache = new Map();
+// Weather data lives here, refreshed on a timer in the background — texts
+// never trigger a live API call themselves. This keeps our request volume
+// low and steady (which matters since Open-Meteo rate-limits by IP, and
+// Render's free tier shares IPs across many apps), and if a refresh fails
+// (e.g. a transient 429) we just keep serving the last known-good data.
+let currentWeatherCache = null;
+let forecastCache = null;
 
-async function getCached(key, ttlMs, fetchFn) {
-  const cached = cache.get(key);
-  const now = Date.now();
+async function fetchWithRetry(url, retries = 2, delayMs = 2000) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url);
+    if (res.ok) return res.json();
 
-  if (cached && now - cached.timestamp < ttlMs) {
-    return cached.data;
+    if (res.status === 429 && attempt < retries) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
+      continue;
+    }
+    throw new Error(`Request failed: ${res.status}`);
   }
-
-  const data = await fetchFn();
-  cache.set(key, { data, timestamp: now });
-  return data;
 }
 
-// Fetch current conditions only
-async function fetchCurrentWeather() {
+async function refreshCurrentWeather() {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
     `&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,relative_humidity_2m` +
     `&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto`;
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Current weather request failed: ${res.status}`);
-  return res.json();
+  try {
+    currentWeatherCache = await fetchWithRetry(url);
+    console.log('Refreshed current weather cache');
+  } catch (err) {
+    console.error('Failed to refresh current weather (keeping last known data):', err.message);
+  }
 }
 
-// Fetch a 7-day daily forecast
-async function fetchWeeklyForecast() {
+async function refreshForecast() {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
     `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
     `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch` +
     `&timezone=auto&forecast_days=7`;
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Forecast request failed: ${res.status}`);
-  return res.json();
+  try {
+    forecastCache = await fetchWithRetry(url);
+    console.log('Refreshed forecast cache');
+  } catch (err) {
+    console.error('Failed to refresh forecast (keeping last known data):', err.message);
+  }
 }
 
-// Current conditions change quickly enough to refresh every 5 minutes;
-// the 7-day outlook is fine refreshed every 30 minutes.
-function getCurrentWeather() {
-  return getCached('current', 5 * 60 * 1000, fetchCurrentWeather);
-}
-
-function getWeeklyForecast() {
-  return getCached('forecast', 30 * 60 * 1000, fetchWeeklyForecast);
-}
+// Prime the cache on startup, then refresh on a timer.
+refreshCurrentWeather();
+refreshForecast();
+setInterval(refreshCurrentWeather, 5 * 60 * 1000);
+setInterval(refreshForecast, 30 * 60 * 1000);
 
 function buildCurrentReply(data) {
   const c = data.current;
@@ -171,23 +174,20 @@ app.post('/sms', async (req, res) => {
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twiml = new MessagingResponse();
 
-  try {
-    if (incomingText === 'current') {
-      const data = await getCurrentWeather();
-      twiml.message(buildCurrentReply(data));
-    } else if (incomingText === 'forecast') {
-      const data = await getWeeklyForecast();
-      twiml.message(buildForecastReply(data));
+  if (incomingText === 'current') {
+    if (currentWeatherCache) {
+      twiml.message(buildCurrentReply(currentWeatherCache));
     } else {
-      twiml.message('Text "current" for current conditions or "forecast" for the 7-day forecast.');
+      twiml.message('Still loading weather data — try again in a few seconds.');
     }
-  } catch (err) {
-    console.error('Error handling SMS:', err);
-    if (err.message && err.message.includes('429')) {
-      twiml.message('Weather service is briefly rate-limited — please try again in a minute.');
+  } else if (incomingText === 'forecast') {
+    if (forecastCache) {
+      twiml.message(buildForecastReply(forecastCache));
     } else {
-      twiml.message('Sorry, something went wrong getting that weather data. Please try again.');
+      twiml.message('Still loading forecast data — try again in a few seconds.');
     }
+  } else {
+    twiml.message('Text "current" for current conditions or "forecast" for the 7-day forecast.');
   }
 
   res.type('text/xml').send(twiml.toString());
