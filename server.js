@@ -54,8 +54,26 @@ function describeWeatherCode(code) {
 
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
+// Simple in-memory cache so repeated texts in a short window don't each
+// trigger a fresh API call (this is also what protects us from Open-Meteo's
+// per-IP rate limit, which matters more on shared hosts like Render's free tier).
+const cache = new Map();
+
+async function getCached(key, ttlMs, fetchFn) {
+  const cached = cache.get(key);
+  const now = Date.now();
+
+  if (cached && now - cached.timestamp < ttlMs) {
+    return cached.data;
+  }
+
+  const data = await fetchFn();
+  cache.set(key, { data, timestamp: now });
+  return data;
+}
+
 // Fetch current conditions only
-async function getCurrentWeather() {
+async function fetchCurrentWeather() {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
     `&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m` +
@@ -67,7 +85,7 @@ async function getCurrentWeather() {
 }
 
 // Fetch a 7-day daily forecast
-async function getWeeklyForecast() {
+async function fetchWeeklyForecast() {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
     `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
@@ -77,6 +95,16 @@ async function getWeeklyForecast() {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Forecast request failed: ${res.status}`);
   return res.json();
+}
+
+// Current conditions change quickly enough to refresh every 5 minutes;
+// the 7-day outlook is fine refreshed every 30 minutes.
+function getCurrentWeather() {
+  return getCached('current', 5 * 60 * 1000, fetchCurrentWeather);
+}
+
+function getWeeklyForecast() {
+  return getCached('forecast', 30 * 60 * 1000, fetchWeeklyForecast);
 }
 
 function buildCurrentReply(data) {
@@ -143,7 +171,11 @@ app.post('/sms', async (req, res) => {
     }
   } catch (err) {
     console.error('Error handling SMS:', err);
-    twiml.message('Sorry, something went wrong getting that weather data. Please try again.');
+    if (err.message && err.message.includes('429')) {
+      twiml.message('Weather service is briefly rate-limited — please try again in a minute.');
+    } else {
+      twiml.message('Sorry, something went wrong getting that weather data. Please try again.');
+    }
   }
 
   res.type('text/xml').send(twiml.toString());
