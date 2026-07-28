@@ -7,6 +7,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+// Fixed location this bot reports on.
+const LATITUDE = 52.123950;
+const LONGITUDE = -111.154412;
+
 // Set to 'true' to validate that incoming requests really came from Twilio.
 // Requires TWILIO_AUTH_TOKEN to be set as an env var on Render.
 const VALIDATE_TWILIO_SIGNATURE = process.env.VALIDATE_TWILIO_SIGNATURE === 'true';
@@ -48,66 +52,64 @@ function describeWeatherCode(code) {
   return WEATHER_CODES[code] || 'Unknown conditions';
 }
 
-// Look up lat/lon for a place name using Open-Meteo's free geocoding API
-async function geocodeLocation(query) {
-  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
-    query
-  )}&count=1&language=en&format=json`;
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+// Fetch current conditions only
+async function getCurrentWeather() {
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
+    `&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m` +
+    `&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto`;
 
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Geocoding request failed: ${res.status}`);
-  const data = await res.json();
-
-  if (!data.results || data.results.length === 0) {
-    return null;
-  }
-
-  const place = data.results[0];
-  return {
-    name: place.name,
-    admin1: place.admin1, // state/region
-    country: place.country_code,
-    latitude: place.latitude,
-    longitude: place.longitude,
-  };
+  if (!res.ok) throw new Error(`Current weather request failed: ${res.status}`);
+  return res.json();
 }
 
-// Fetch current weather + today's forecast for given coordinates
-async function getForecast(latitude, longitude) {
+// Fetch a 7-day daily forecast
+async function getWeeklyForecast() {
   const url =
-    `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}` +
-    `&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m` +
-    `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
+    `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
+    `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
     `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch` +
-    `&timezone=auto&forecast_days=1`;
+    `&timezone=auto&forecast_days=7`;
 
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Forecast request failed: ${res.status}`);
   return res.json();
 }
 
-function buildReplyText(place, forecast) {
-  const current = forecast.current;
-  const daily = forecast.daily;
-
-  const locationLabel = [place.name, place.admin1, place.country]
-    .filter(Boolean)
-    .join(', ');
-
-  const conditions = describeWeatherCode(current.weather_code);
-  const temp = Math.round(current.temperature_2m);
-  const feelsLike = Math.round(current.apparent_temperature);
-  const wind = Math.round(current.wind_speed_10m);
-  const high = Math.round(daily.temperature_2m_max[0]);
-  const low = Math.round(daily.temperature_2m_min[0]);
-  const rainChance = daily.precipitation_probability_max[0];
+function buildCurrentReply(data) {
+  const c = data.current;
+  const temp = Math.round(c.temperature_2m);
+  const feelsLike = Math.round(c.apparent_temperature);
+  const wind = Math.round(c.wind_speed_10m);
+  const humidity = Math.round(c.relative_humidity_2m);
+  const conditions = describeWeatherCode(c.weather_code);
 
   return (
-    `Weather for ${locationLabel}:\n` +
+    `Current conditions:\n` +
     `${conditions}, ${temp}°F (feels like ${feelsLike}°F)\n` +
-    `Today's high/low: ${high}°F / ${low}°F\n` +
-    `Wind: ${wind} mph | Chance of rain: ${rainChance}%`
+    `Humidity: ${humidity}% | Wind: ${wind} mph`
   );
+}
+
+function buildForecastReply(data) {
+  const d = data.daily;
+  const lines = ['7-day forecast:'];
+
+  for (let i = 0; i < d.time.length; i++) {
+    const date = new Date(d.time[i] + 'T00:00:00');
+    const dayLabel = i === 0 ? 'Today' : DAY_NAMES[date.getDay()];
+    const high = Math.round(d.temperature_2m_max[i]);
+    const low = Math.round(d.temperature_2m_min[i]);
+    const rain = d.precipitation_probability_max[i];
+    const conditions = describeWeatherCode(d.weather_code[i]);
+
+    lines.push(`${dayLabel}: ${conditions}, ${high}°/${low}°F, ${rain}% rain`);
+  }
+
+  return lines.join('\n');
 }
 
 app.post('/sms', async (req, res) => {
@@ -125,33 +127,23 @@ app.post('/sms', async (req, res) => {
     }
   }
 
-  const incomingText = (req.body.Body || '').trim();
+  const incomingText = (req.body.Body || '').trim().toLowerCase();
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twiml = new MessagingResponse();
 
-  if (!incomingText) {
-    twiml.message('Text me a city (and state/country if you like), e.g. "Detroit, MI".');
-    res.type('text/xml').send(twiml.toString());
-    return;
-  }
-
   try {
-    const place = await geocodeLocation(incomingText);
-
-    if (!place) {
-      twiml.message(
-        `I couldn't find a location matching "${incomingText}". Try a city name, e.g. "Ann Arbor, MI".`
-      );
-      res.type('text/xml').send(twiml.toString());
-      return;
+    if (incomingText === 'current') {
+      const data = await getCurrentWeather();
+      twiml.message(buildCurrentReply(data));
+    } else if (incomingText === 'forecast') {
+      const data = await getWeeklyForecast();
+      twiml.message(buildForecastReply(data));
+    } else {
+      twiml.message('Text "current" for current conditions or "forecast" for the 7-day forecast.');
     }
-
-    const forecast = await getForecast(place.latitude, place.longitude);
-    const replyText = buildReplyText(place, forecast);
-    twiml.message(replyText);
   } catch (err) {
     console.error('Error handling SMS:', err);
-    twiml.message('Sorry, something went wrong getting that forecast. Please try again.');
+    twiml.message('Sorry, something went wrong getting that weather data. Please try again.');
   }
 
   res.type('text/xml').send(twiml.toString());
