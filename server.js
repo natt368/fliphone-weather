@@ -58,7 +58,7 @@ async function fetchWithRetry(url, retries = 2, delayMs = 2000) {
 async function refreshCurrentWeather() {
   const url =
     `https://api.openweathermap.org/data/2.5/weather` +
-    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=imperial`;
+    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=metric`;
 
   try {
     currentWeatherCache = await fetchWithRetry(url);
@@ -74,7 +74,7 @@ async function refreshCurrentWeather() {
 async function refreshForecast() {
   const url =
     `https://api.openweathermap.org/data/2.5/forecast` +
-    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=imperial`;
+    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=metric`;
 
   try {
     forecastCache = await fetchWithRetry(url);
@@ -93,16 +93,16 @@ setInterval(refreshForecast, 30 * 60 * 1000);
 function buildCurrentReply(data) {
   const temp = Math.round(data.main.temp);
   const humidity = Math.round(data.main.humidity);
-  const wind = Math.round(data.wind.speed);
+  const wind = Math.round(data.wind.speed * 3.6);
   const windDir = degreesToCompass(data.wind.deg);
   const conditions = titleCase(data.weather[0].description);
 
   return (
     `Current conditions:\n` +
     `${conditions}\n` +
-    `Temp: ${temp}°F\n` +
+    `Temp: ${temp}°C\n` +
     `Humidity: ${humidity}%\n` +
-    `Wind: ${wind} mph ${windDir}`
+    `Wind: ${wind} kph ${windDir}`
   );
 }
 
@@ -152,7 +152,7 @@ function buildForecastReply(data) {
     const rain = Math.round(day.rainChance * 100);
     const conditions = titleCase(day.conditions);
 
-    lines.push(`${dayLabel}: ${conditions}, ${high}°/${low}°F, ${rain}% rain`);
+    lines.push(`${dayLabel}: ${conditions}, ${high}°/${low}°C, ${rain}% rain`);
   });
 
   return lines.join('\n');
