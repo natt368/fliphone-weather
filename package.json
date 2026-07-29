@@ -1,16 +1,18 @@
 {
   "name": "text-weather-bot",
   "version": "1.0.0",
-  "description": "Text a Twilio number and get back the weather forecast for any location.",
-  "main": "server.js",
+  "description": "Sends weather via Twilio SMS and/or email-to-SMS gateway.",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "twilio": "^5.3.0"
+    "twilio": "^5.3.0",
+    "nodemailer": "^6.9.14",
+    "node-cron": "^3.0.3"
   }
 }
