@@ -1,5 +1,7 @@
 const express = require('express');
 const twilio = require('twilio');
+const nodemailer = require('nodemailer');
+const cron = require('node-cron');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -19,6 +21,33 @@ const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
 // Requires TWILIO_AUTH_TOKEN to be set as an env var on Render.
 const VALIDATE_TWILIO_SIGNATURE = process.env.VALIDATE_TWILIO_SIGNATURE === 'true';
 
+// Your carrier's email-to-SMS gateway address. This is the flip phone.
+// (Telus gateway — no Twilio account or per-message cost involved.)
+const TO_EMAIL = process.env.TO_EMAIL || '4035759753@msg.telus.com';
+
+// SMTP credentials for actually sending the email. Set these as env vars
+// on Render. Gmail works fine here with an "app password" — regular
+// account passwords won't work with SMTP.
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
+
+// Cron schedule for the daily send, in the format node-cron expects
+// (minute hour * * *). Defaults to 7:00 AM. Override with DAILY_CRON.
+const DAILY_CRON = process.env.DAILY_CRON || '0 7 * * *';
+// Timezone the cron schedule is evaluated in — defaults to Alberta,
+// since that's where the phone number's area code is from.
+const TZ_NAME = process.env.TZ_NAME || 'America/Edmonton';
+
+const transporter = nodemailer.createTransport({
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  secure: SMTP_PORT === 465,
+  auth: { user: SMTP_USER, pass: SMTP_PASS },
+});
+
 const COMPASS_POINTS = [
   'N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
   'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW',
@@ -35,10 +64,10 @@ function titleCase(str) {
 
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-// Weather data lives here, refreshed on a timer in the background — texts
-// never trigger a live API call themselves. This keeps request volume low
-// and steady, and if a refresh fails we just keep serving the last
-// known-good data instead of erroring out to the user.
+// Weather data lives here, refreshed on a timer in the background — an
+// email send never triggers a live API call itself. This keeps request
+// volume low and steady, and if a refresh fails we just keep serving the
+// last known-good data instead of erroring out.
 let currentWeatherCache = null;
 let forecastCache = null;
 
@@ -158,7 +187,45 @@ function buildForecastReply(data) {
   return lines.join('\n');
 }
 
-app.post('/sms', async (req, res) => {
+// Combines current conditions + forecast into a single short, SMS-style
+// message body — same plain-text format as before, just delivered by
+// email instead of Twilio.
+function buildCombinedMessage() {
+  if (!currentWeatherCache || !forecastCache) {
+    return null;
+  }
+  return `${buildCurrentReply(currentWeatherCache)}\n\n${buildForecastReply(forecastCache)}`;
+}
+
+async function sendWeatherEmail() {
+  const body = buildCombinedMessage();
+  if (!body) {
+    throw new Error('Weather data not loaded yet — try again in a few seconds.');
+  }
+
+  // Subject is ignored by most carrier gateways, but harmless to include.
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to: TO_EMAIL,
+    subject: 'Weather',
+    text: body,
+  });
+
+  console.log('Weather email sent to', TO_EMAIL);
+}
+
+// Daily scheduled send.
+cron.schedule(
+  DAILY_CRON,
+  () => {
+    sendWeatherEmail().catch((err) => console.error('Scheduled email send failed:', err.message));
+  },
+  { timezone: TZ_NAME }
+);
+
+// Twilio SMS webhook — point your Twilio number's "A message comes in"
+// setting at https://<your-render-url>/sms
+app.post('/sms', (req, res) => {
   if (VALIDATE_TWILIO_SIGNATURE) {
     const signature = req.headers['x-twilio-signature'];
     const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
@@ -194,6 +261,16 @@ app.post('/sms', async (req, res) => {
   }
 
   res.type('text/xml').send(twiml.toString());
+});
+
+// Manual trigger — hit this whenever you want the weather sent right now.
+app.get('/send-now', async (req, res) => {
+  try {
+    await sendWeatherEmail();
+    res.send('Weather email sent.');
+  } catch (err) {
+    res.status(503).send(err.message);
+  }
 });
 
 // Simple health check for Render
