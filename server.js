@@ -137,7 +137,7 @@ function buildCurrentReply(data) {
   return (
     `Current conditions:\n` +
     `${conditions}\n` +
-    `Temp: ${temp}°C\n` +
+    `Temp: ${temp}C\n` + // Removed degree symbol for GSM-7 compatibility
     `Humidity: ${humidity}%\n` +
     `Wind: ${wind} kph ${windDir}`
   );
@@ -179,17 +179,17 @@ function groupForecastByDay(list) {
 
 function buildForecastReply(data) {
   const days = groupForecastByDay(data.list);
-  const lines = ['5-day forecast:'];
+  const lines = ['5-day:']; // Shortened header
 
-  days.forEach((day, i) => {
+  // Sliced to strictly 5 days and stripped conditions/degree symbol for length and GSM-7 compliance
+  days.slice(0, 5).forEach((day, i) => {
     const date = new Date(day.date + 'T00:00:00');
     const dayLabel = i === 0 ? 'Today' : DAY_NAMES[date.getDay()];
     const high = Math.round(day.high);
     const low = Math.round(day.low);
     const rain = Math.round(day.rainChance * 100);
-    const conditions = titleCase(day.conditions);
 
-    lines.push(`${dayLabel}: ${conditions}, ${high}°/${low}°C, ${rain}% rain`);
+    lines.push(`${dayLabel}: ${high}/${low}C, ${rain}% rain`);
   });
 
   return lines.join('\n');
