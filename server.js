@@ -90,7 +90,11 @@ async function refreshCurrentWeather() {
     `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=metric`;
 
   try {
-    currentWeatherCache = await fetchWithRetry(url);
+    const data = await fetchWithRetry(url);
+    if (!data || !data.main || !data.weather) {
+      throw new Error(`Unexpected current weather response: ${JSON.stringify(data)}`);
+    }
+    currentWeatherCache = data;
     console.log('Refreshed current weather cache');
   } catch (err) {
     console.error('Failed to refresh current weather (keeping last known data):', err.message);
@@ -106,7 +110,11 @@ async function refreshForecast() {
     `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=metric`;
 
   try {
-    forecastCache = await fetchWithRetry(url);
+    const data = await fetchWithRetry(url);
+    if (!data || !Array.isArray(data.list) || data.list.length === 0) {
+      throw new Error(`Unexpected forecast response: ${JSON.stringify(data)}`);
+    }
+    forecastCache = data;
     console.log('Refreshed forecast cache');
   } catch (err) {
     console.error('Failed to refresh forecast (keeping last known data):', err.message);
@@ -244,20 +252,25 @@ app.post('/sms', (req, res) => {
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twiml = new MessagingResponse();
 
-  if (incomingText === 'current') {
-    if (currentWeatherCache) {
-      twiml.message(buildCurrentReply(currentWeatherCache));
+  try {
+    if (incomingText === 'current') {
+      if (currentWeatherCache) {
+        twiml.message(buildCurrentReply(currentWeatherCache));
+      } else {
+        twiml.message('Still loading weather data — try again in a few seconds.');
+      }
+    } else if (incomingText === 'forecast') {
+      if (forecastCache) {
+        twiml.message(buildForecastReply(forecastCache));
+      } else {
+        twiml.message('Still loading forecast data — try again in a few seconds.');
+      }
     } else {
-      twiml.message('Still loading weather data — try again in a few seconds.');
+      twiml.message('Text "current" for current conditions or "forecast" for the 5-day forecast.');
     }
-  } else if (incomingText === 'forecast') {
-    if (forecastCache) {
-      twiml.message(buildForecastReply(forecastCache));
-    } else {
-      twiml.message('Still loading forecast data — try again in a few seconds.');
-    }
-  } else {
-    twiml.message('Text "current" for current conditions or "forecast" for the 5-day forecast.');
+  } catch (err) {
+    console.error('Error building SMS reply:', err.stack);
+    twiml.message('Something went wrong pulling that up — try again shortly.');
   }
 
   res.type('text/xml').send(twiml.toString());
