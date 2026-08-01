@@ -175,10 +175,7 @@ function buildForecastReply(data) {
 }
 
 function buildDailyReply() {
-  const parts = [];
-  if (currentWeatherCache) parts.push(buildCurrentReply(currentWeatherCache));
-  if (forecastCache) parts.push(buildForecastReply(forecastCache));
-  return parts.join('\n\n');
+  return forecastCache ? buildForecastReply(forecastCache) : '';
 }
 
 async function sendDailyWeatherText() {
@@ -189,7 +186,6 @@ async function sendDailyWeatherText() {
 
   // Make sure we have fresh-ish data before sending, in case the last
   // background refresh failed.
-  if (!currentWeatherCache) await refreshCurrentWeather();
   if (!forecastCache) await refreshForecast();
 
   const body = buildDailyReply();
