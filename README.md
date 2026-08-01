@@ -11,6 +11,23 @@ The location is hardcoded in `server.js` (currently `52.123950, -111.154412`). T
 
 Any other text gets a reply reminding the sender of these two commands.
 
+## Daily automatic text
+
+Every day at **7:00 AM Mountain Time**, the app sends an outbound text (current conditions + the 5-day forecast) directly via Twilio's SMS API — no reply needed, no email gateway involved.
+
+This needs 4 more env vars set on Render (**Environment** tab):
+
+| Key | Value |
+|---|---|
+| `TWILIO_ACCOUNT_SID` | From the Twilio Console dashboard homepage |
+| `TWILIO_AUTH_TOKEN` | From the same place |
+| `TWILIO_PHONE_NUMBER` | Your Twilio number, in `+1XXXXXXXXXX` format |
+| `RECIPIENT_PHONE_NUMBER` | The flip phone's number, in `+1XXXXXXXXXX` format |
+
+**To test it immediately** without waiting for 7 AM, visit `https://your-app-name.onrender.com/send-daily-test` in a browser — it triggers the same send function on demand and shows a confirmation.
+
+Note: on a Twilio trial account, this only works if `RECIPIENT_PHONE_NUMBER` is a verified caller ID on your account (Twilio Console → Phone Numbers → Verified Caller IDs).
+
 ## How it works
 
 1. In the background, the server refreshes current conditions every 5 minutes and the forecast every 30 minutes, and keeps the latest copy of each in memory.
