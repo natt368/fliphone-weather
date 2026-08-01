@@ -1,6 +1,5 @@
 const express = require('express');
 const twilio = require('twilio');
-const nodemailer = require('nodemailer');
 const cron = require('node-cron');
 
 const app = express();
@@ -17,36 +16,24 @@ const LONGITUDE = -111.154412;
 // needed for this tier) and set it as an OPENWEATHER_API_KEY env var on Render.
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
 
+// Required for the daily outbound text and (optionally) for validating
+// inbound webhook signatures. Set these as env vars on Render:
+//   TWILIO_ACCOUNT_SID    - from the Twilio Console dashboard
+//   TWILIO_AUTH_TOKEN     - from the Twilio Console dashboard
+//   TWILIO_PHONE_NUMBER   - your Twilio number, e.g. +15551234567
+//   RECIPIENT_PHONE_NUMBER - the flip phone's number, e.g. +14035759753
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
+const RECIPIENT_PHONE_NUMBER = process.env.RECIPIENT_PHONE_NUMBER;
+
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+
 // Set to 'true' to validate that incoming requests really came from Twilio.
-// Requires TWILIO_AUTH_TOKEN to be set as an env var on Render.
 const VALIDATE_TWILIO_SIGNATURE = process.env.VALIDATE_TWILIO_SIGNATURE === 'true';
-
-// Your carrier's email-to-SMS gateway address. This is the flip phone.
-// (Telus gateway — no Twilio account or per-message cost involved.)
-const TO_EMAIL = process.env.TO_EMAIL || '4035759753@msg.telus.com';
-
-// SMTP credentials for actually sending the email. Set these as env vars
-// on Render. Gmail works fine here with an "app password" — regular
-// account passwords won't work with SMTP.
-const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
-const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
-const SMTP_USER = process.env.SMTP_USER;
-const SMTP_PASS = process.env.SMTP_PASS;
-const EMAIL_FROM = process.env.EMAIL_FROM || SMTP_USER;
-
-// Cron schedule for the daily send, in the format node-cron expects
-// (minute hour * * *). Defaults to 7:00 AM. Override with DAILY_CRON.
-const DAILY_CRON = process.env.DAILY_CRON || '0 7 * * *';
-// Timezone the cron schedule is evaluated in — defaults to Alberta,
-// since that's where the phone number's area code is from.
-const TZ_NAME = process.env.TZ_NAME || 'America/Edmonton';
-
-const transporter = nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  secure: SMTP_PORT === 465,
-  auth: { user: SMTP_USER, pass: SMTP_PASS },
-});
 
 const COMPASS_POINTS = [
   'N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
@@ -64,10 +51,10 @@ function titleCase(str) {
 
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-// Weather data lives here, refreshed on a timer in the background — an
-// email send never triggers a live API call itself. This keeps request
-// volume low and steady, and if a refresh fails we just keep serving the
-// last known-good data instead of erroring out.
+// Weather data lives here, refreshed on a timer in the background — texts
+// never trigger a live API call themselves. This keeps request volume low
+// and steady, and if a refresh fails we just keep serving the last
+// known-good data instead of erroring out to the user.
 let currentWeatherCache = null;
 let forecastCache = null;
 
@@ -87,14 +74,10 @@ async function fetchWithRetry(url, retries = 2, delayMs = 2000) {
 async function refreshCurrentWeather() {
   const url =
     `https://api.openweathermap.org/data/2.5/weather` +
-    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=imperial`;
 
   try {
-    const data = await fetchWithRetry(url);
-    if (!data || !data.main || !data.weather) {
-      throw new Error(`Unexpected current weather response: ${JSON.stringify(data)}`);
-    }
-    currentWeatherCache = data;
+    currentWeatherCache = await fetchWithRetry(url);
     console.log('Refreshed current weather cache');
   } catch (err) {
     console.error('Failed to refresh current weather (keeping last known data):', err.message);
@@ -107,14 +90,10 @@ async function refreshCurrentWeather() {
 async function refreshForecast() {
   const url =
     `https://api.openweathermap.org/data/2.5/forecast` +
-    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+    `?lat=${LATITUDE}&lon=${LONGITUDE}&appid=${OPENWEATHER_API_KEY}&units=imperial`;
 
   try {
-    const data = await fetchWithRetry(url);
-    if (!data || !Array.isArray(data.list) || data.list.length === 0) {
-      throw new Error(`Unexpected forecast response: ${JSON.stringify(data)}`);
-    }
-    forecastCache = data;
+    forecastCache = await fetchWithRetry(url);
     console.log('Refreshed forecast cache');
   } catch (err) {
     console.error('Failed to refresh forecast (keeping last known data):', err.message);
@@ -130,16 +109,16 @@ setInterval(refreshForecast, 30 * 60 * 1000);
 function buildCurrentReply(data) {
   const temp = Math.round(data.main.temp);
   const humidity = Math.round(data.main.humidity);
-  const wind = Math.round(data.wind.speed * 3.6);
+  const wind = Math.round(data.wind.speed);
   const windDir = degreesToCompass(data.wind.deg);
   const conditions = titleCase(data.weather[0].description);
 
   return (
     `Current conditions:\n` +
     `${conditions}\n` +
-    `Temp: ${temp}C\n` + // Removed degree symbol for GSM-7 compatibility
+    `Temp: ${temp}°F\n` +
     `Humidity: ${humidity}%\n` +
-    `Wind: ${wind} kph ${windDir}`
+    `Wind: ${wind} mph ${windDir}`
   );
 }
 
@@ -179,61 +158,64 @@ function groupForecastByDay(list) {
 
 function buildForecastReply(data) {
   const days = groupForecastByDay(data.list);
-  const lines = ['5-day:']; // Shortened header
+  const lines = ['5-day forecast:'];
 
-  // Sliced to strictly 5 days and stripped conditions/degree symbol for length and GSM-7 compliance
-  days.slice(0, 5).forEach((day, i) => {
+  days.forEach((day, i) => {
     const date = new Date(day.date + 'T00:00:00');
     const dayLabel = i === 0 ? 'Today' : DAY_NAMES[date.getDay()];
     const high = Math.round(day.high);
     const low = Math.round(day.low);
     const rain = Math.round(day.rainChance * 100);
+    const conditions = titleCase(day.conditions);
 
-    lines.push(`${dayLabel}: ${high}/${low}C, ${rain}% rain`);
+    lines.push(`${dayLabel}: ${conditions}, ${high}°/${low}°F, ${rain}% rain`);
   });
 
   return lines.join('\n');
 }
 
-// Combines current conditions + forecast into a single short, SMS-style
-// message body — same plain-text format as before, just delivered by
-// email instead of Twilio.
-function buildCombinedMessage() {
-  if (!currentWeatherCache || !forecastCache) {
-    return null;
-  }
-  return `${buildCurrentReply(currentWeatherCache)}\n\n${buildForecastReply(forecastCache)}`;
+function buildDailyReply() {
+  const parts = [];
+  if (currentWeatherCache) parts.push(buildCurrentReply(currentWeatherCache));
+  if (forecastCache) parts.push(buildForecastReply(forecastCache));
+  return parts.join('\n\n');
 }
 
-async function sendWeatherEmail() {
-  const body = buildCombinedMessage();
+async function sendDailyWeatherText() {
+  if (!twilioClient || !TWILIO_PHONE_NUMBER || !RECIPIENT_PHONE_NUMBER) {
+    console.error('Skipping daily text: missing TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, or RECIPIENT_PHONE_NUMBER');
+    return;
+  }
+
+  // Make sure we have fresh-ish data before sending, in case the last
+  // background refresh failed.
+  if (!currentWeatherCache) await refreshCurrentWeather();
+  if (!forecastCache) await refreshForecast();
+
+  const body = buildDailyReply();
   if (!body) {
-    throw new Error('Weather data not loaded yet — try again in a few seconds.');
+    console.error('Skipping daily text: no weather data available');
+    return;
   }
 
-  // Subject is ignored by most carrier gateways, but harmless to include.
-  await transporter.sendMail({
-    from: EMAIL_FROM,
-    to: TO_EMAIL,
-    subject: 'Weather',
-    text: body,
-  });
-
-  console.log('Weather email sent to', TO_EMAIL);
+  try {
+    await twilioClient.messages.create({
+      body,
+      from: TWILIO_PHONE_NUMBER,
+      to: RECIPIENT_PHONE_NUMBER,
+    });
+    console.log('Sent daily weather text');
+  } catch (err) {
+    console.error('Failed to send daily weather text:', err.message);
+  }
 }
 
-// Daily scheduled send.
-cron.schedule(
-  DAILY_CRON,
-  () => {
-    sendWeatherEmail().catch((err) => console.error('Scheduled email send failed:', err.message));
-  },
-  { timezone: TZ_NAME }
-);
+// 7:00 AM Mountain Time, every day. America/Edmonton follows the same
+// clock as Alberta, including its own DST changes, so 7 AM stays 7 AM
+// on the ground year-round.
+cron.schedule('0 7 * * *', sendDailyWeatherText, { timezone: 'America/Edmonton' });
 
-// Twilio SMS webhook — point your Twilio number's "A message comes in"
-// setting at https://<your-render-url>/sms
-app.post('/sms', (req, res) => {
+app.post('/sms', async (req, res) => {
   if (VALIDATE_TWILIO_SIGNATURE) {
     const signature = req.headers['x-twilio-signature'];
     const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
@@ -252,43 +234,35 @@ app.post('/sms', (req, res) => {
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twiml = new MessagingResponse();
 
-  try {
-    if (incomingText === 'current') {
-      if (currentWeatherCache) {
-        twiml.message(buildCurrentReply(currentWeatherCache));
-      } else {
-        twiml.message('Still loading weather data — try again in a few seconds.');
-      }
-    } else if (incomingText === 'forecast') {
-      if (forecastCache) {
-        twiml.message(buildForecastReply(forecastCache));
-      } else {
-        twiml.message('Still loading forecast data — try again in a few seconds.');
-      }
+  if (incomingText === 'current') {
+    if (currentWeatherCache) {
+      twiml.message(buildCurrentReply(currentWeatherCache));
     } else {
-      twiml.message('Text "current" for current conditions or "forecast" for the 5-day forecast.');
+      twiml.message('Still loading weather data — try again in a few seconds.');
     }
-  } catch (err) {
-    console.error('Error building SMS reply:', err.stack);
-    twiml.message('Something went wrong pulling that up — try again shortly.');
+  } else if (incomingText === 'forecast') {
+    if (forecastCache) {
+      twiml.message(buildForecastReply(forecastCache));
+    } else {
+      twiml.message('Still loading forecast data — try again in a few seconds.');
+    }
+  } else {
+    twiml.message('Text "current" for current conditions or "forecast" for the 5-day forecast.');
   }
 
   res.type('text/xml').send(twiml.toString());
 });
 
-// Manual trigger — hit this whenever you want the weather sent right now.
-app.get('/send-now', async (req, res) => {
-  try {
-    await sendWeatherEmail();
-    res.send('Weather email sent.');
-  } catch (err) {
-    res.status(503).send(err.message);
-  }
-});
-
 // Simple health check for Render
 app.get('/', (req, res) => {
   res.send('Text Weather Bot is running.');
+});
+
+// Manual trigger for testing the daily text without waiting for 7 AM.
+// Visit this URL in a browser (or curl it) to send it immediately.
+app.get('/send-daily-test', async (req, res) => {
+  await sendDailyWeatherText();
+  res.send('Triggered daily text — check your phone and the Render logs.');
 });
 
 app.listen(PORT, () => {
