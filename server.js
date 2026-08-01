@@ -156,9 +156,9 @@ function groupForecastByDay(list) {
   return [...days.values()];
 }
 
-function buildForecastReply(data) {
-  const days = groupForecastByDay(data.list);
-  const lines = ['5-day forecast:'];
+function buildForecastReply(data, maxDays = 5) {
+  const days = groupForecastByDay(data.list).slice(0, maxDays);
+  const lines = [`${maxDays}-day forecast:`];
 
   days.forEach((day, i) => {
     const date = new Date(day.date + 'T00:00:00');
@@ -174,8 +174,10 @@ function buildForecastReply(data) {
   return lines.join('\n');
 }
 
+// The daily auto-text is trimmed to 3 days to comfortably stay within the
+// SMS segment limit Twilio enforces on trial accounts (error 30044).
 function buildDailyReply() {
-  return forecastCache ? buildForecastReply(forecastCache) : '';
+  return forecastCache ? buildForecastReply(forecastCache, 3) : '';
 }
 
 async function sendDailyWeatherText() {
