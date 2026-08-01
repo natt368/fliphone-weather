@@ -1,6 +1,7 @@
 const express = require('express');
 const twilio = require('twilio');
 const cron = require('node-cron');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -16,20 +17,23 @@ const LONGITUDE = -111.154412;
 // needed for this tier) and set it as an OPENWEATHER_API_KEY env var on Render.
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
 
-// Required for the daily outbound text and (optionally) for validating
-// inbound webhook signatures. Set these as env vars on Render:
-//   TWILIO_ACCOUNT_SID    - from the Twilio Console dashboard
-//   TWILIO_AUTH_TOKEN     - from the Twilio Console dashboard
-//   TWILIO_PHONE_NUMBER   - your Twilio number, e.g. +15551234567
-//   RECIPIENT_PHONE_NUMBER - the flip phone's number, e.g. +14035759753
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+// Only needed if you turn on VALIDATE_TWILIO_SIGNATURE below.
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
-const RECIPIENT_PHONE_NUMBER = process.env.RECIPIENT_PHONE_NUMBER;
 
-const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+// The daily forecast goes out for free via Telus's email-to-SMS gateway
+// (no Twilio cost at all) instead of through Twilio. Set these env vars:
+//   SMTP_USER - the sending Gmail address, e.g. you@gmail.com
+//   SMTP_PASS - a Gmail App Password (not your normal password) — see README
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const DAILY_EMAIL_TO = process.env.DAILY_EMAIL_TO || '4035759753@msg.telus.com';
+
+const mailTransporter =
+  SMTP_USER && SMTP_PASS
+    ? nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+      })
     : null;
 
 // Set to 'true' to validate that incoming requests really came from Twilio.
@@ -174,15 +178,16 @@ function buildForecastReply(data, maxDays = 5) {
   return lines.join('\n');
 }
 
-// The daily auto-text is trimmed to 3 days to comfortably stay within the
-// SMS segment limit Twilio enforces on trial accounts (error 30044).
+// The daily forecast can be the full 5 days now — email-to-SMS gateways
+// aren't subject to Twilio's trial segment limit, though Telus will still
+// split it into multiple texts on the phone if it's long.
 function buildDailyReply() {
-  return forecastCache ? buildForecastReply(forecastCache, 3) : '';
+  return forecastCache ? buildForecastReply(forecastCache, 5) : '';
 }
 
-async function sendDailyWeatherText() {
-  if (!twilioClient || !TWILIO_PHONE_NUMBER || !RECIPIENT_PHONE_NUMBER) {
-    console.error('Skipping daily text: missing TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, or RECIPIENT_PHONE_NUMBER');
+async function sendDailyWeatherEmail() {
+  if (!mailTransporter) {
+    console.error('Skipping daily email: missing SMTP_USER or SMTP_PASS');
     return;
   }
 
@@ -192,26 +197,27 @@ async function sendDailyWeatherText() {
 
   const body = buildDailyReply();
   if (!body) {
-    console.error('Skipping daily text: no weather data available');
+    console.error('Skipping daily email: no weather data available');
     return;
   }
 
   try {
-    await twilioClient.messages.create({
-      body,
-      from: TWILIO_PHONE_NUMBER,
-      to: RECIPIENT_PHONE_NUMBER,
+    await mailTransporter.sendMail({
+      from: SMTP_USER,
+      to: DAILY_EMAIL_TO,
+      subject: '', // keep blank - most SMS gateways ignore/drop the subject anyway
+      text: body,
     });
-    console.log('Sent daily weather text');
+    console.log('Sent daily weather email to', DAILY_EMAIL_TO);
   } catch (err) {
-    console.error('Failed to send daily weather text:', err.message);
+    console.error('Failed to send daily weather email:', err.message);
   }
 }
 
 // 7:00 AM Mountain Time, every day. America/Edmonton follows the same
 // clock as Alberta, including its own DST changes, so 7 AM stays 7 AM
 // on the ground year-round.
-cron.schedule('0 7 * * *', sendDailyWeatherText, { timezone: 'America/Edmonton' });
+cron.schedule('0 7 * * *', sendDailyWeatherEmail, { timezone: 'America/Edmonton' });
 
 app.post('/sms', async (req, res) => {
   if (VALIDATE_TWILIO_SIGNATURE) {
@@ -256,11 +262,11 @@ app.get('/', (req, res) => {
   res.send('Text Weather Bot is running.');
 });
 
-// Manual trigger for testing the daily text without waiting for 7 AM.
+// Manual trigger for testing the daily email without waiting for 7 AM.
 // Visit this URL in a browser (or curl it) to send it immediately.
 app.get('/send-daily-test', async (req, res) => {
-  await sendDailyWeatherText();
-  res.send('Triggered daily text — check your phone and the Render logs.');
+  await sendDailyWeatherEmail();
+  res.send('Triggered daily email — check your phone and the Render logs.');
 });
 
 app.listen(PORT, () => {
